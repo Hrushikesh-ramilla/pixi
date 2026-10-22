@@ -143,18 +143,24 @@ const NON_SEMVER_PACKAGES: [&str; 11] = [
 
 type HostScopeCache = Vec<(HostScope, Arc<HostDetection>)>;
 
-/// Append-only, so references to earlier hosts stay valid.
+/// The detections for one environment, in the order they were made.
+/// `host()` returns the latest. Append-only, so references to earlier
+/// detections stay valid.
 #[derive(Default)]
 struct EnvironmentHosts {
+    /// The first detection, or empty before any.
     snapshot: OnceCell<Box<HostSnapshot>>,
 }
 
+/// One detection in [`EnvironmentHosts`].
 struct HostSnapshot {
     host: Arc<HostDetection>,
+    /// The detections made after this one.
     next: EnvironmentHosts,
 }
 
 impl EnvironmentHosts {
+    /// The latest detection, or `None` before any.
     fn host(&self) -> Option<&HostDetection> {
         let mut current = self.snapshot.get()?;
         while let Some(next) = current.next.snapshot.get() {
@@ -163,7 +169,8 @@ impl EnvironmentHosts {
         Some(current.host.as_ref())
     }
 
-    /// Callers hold the `environment_host_scopes` lock.
+    /// Appends `host` unless it's already the latest. Callers hold the
+    /// `environment_host_scopes` lock.
     fn publish(&self, host: Arc<HostDetection>) {
         let mut entry = self;
         while let Some(snapshot) = entry.snapshot.get() {

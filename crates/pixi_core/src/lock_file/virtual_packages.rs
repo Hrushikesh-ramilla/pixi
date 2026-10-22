@@ -184,7 +184,10 @@ pub(crate) fn compute_required_virtual_package_specs(
 
 /// The virtual packages the locked packages and platforms need from the host.
 pub(crate) struct LockedHostRequirements {
+    /// The virtual packages to detect.
     pub names: BTreeSet<PackageName>,
+    /// Whether the lock file contains source packages. Building them may need
+    /// more virtual packages than `names`.
     pub has_source_packages: bool,
 }
 
