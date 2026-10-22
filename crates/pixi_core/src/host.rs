@@ -1007,7 +1007,8 @@ pub fn s3_config_of(manifest: &pixi_manifest::WorkspaceManifest) -> HashMap<Stri
 #[derive(PartialEq)]
 pub(crate) struct HostScope {
     channels: Vec<ChannelUrl>,
-    specs: Vec<MatchSpec>,
+    /// `None` skips the repodata query and detects only `names`.
+    specs: Option<Vec<MatchSpec>>,
     names: BTreeSet<PackageName>,
 }
 
@@ -1045,8 +1046,43 @@ impl HostScope {
         !self.names.is_empty()
     }
 
+    /// Whether a detection for `self` can be reused for `other`.
+    pub(crate) fn covers(&self, other: &Self) -> bool {
+        self.channels == other.channels
+            && self.names.is_superset(&other.names)
+            && (other.specs.is_none() || self.specs == other.specs)
+    }
+
+    /// Only the names the platforms declare, without querying repodata.
+    pub(crate) fn for_platform_selection(
+        environment: &GroupedEnvironment<'_>,
+    ) -> Result<Self, HostProbeError> {
+        Self::for_environment_with_specs(environment, false)
+    }
+
+    /// Only `names`, without querying repodata.
+    pub(crate) fn for_locked_install(
+        environment: &GroupedEnvironment<'_>,
+        names: BTreeSet<PackageName>,
+    ) -> Result<Self, HostProbeError> {
+        Ok(Self {
+            channels: environment
+                .channel_urls(&environment.channel_config())
+                .map_err(HostProbeError::Channel)?,
+            specs: None,
+            names,
+        })
+    }
+
     pub(crate) fn for_environment(
         environment: &GroupedEnvironment<'_>,
+    ) -> Result<Self, HostProbeError> {
+        Self::for_environment_with_specs(environment, true)
+    }
+
+    fn for_environment_with_specs(
+        environment: &GroupedEnvironment<'_>,
+        include_specs: bool,
     ) -> Result<Self, HostProbeError> {
         let channel_config = environment.channel_config();
         let subdirs = candidate_subdirs(host_subdir());
@@ -1062,7 +1098,7 @@ impl HostScope {
             .filter(|platform| {
                 platform_names.contains(platform.name()) && subdirs.contains(&platform.subdir())
             });
-        Self::for_platforms(environment, platforms, &channel_config)
+        Self::for_platforms(environment, platforms, &channel_config, include_specs)
     }
 
     fn for_script(
@@ -1073,20 +1109,26 @@ impl HostScope {
         if manifest.workspace.platforms.is_empty() {
             // Implicit scripts resolve for the host, including its target dependencies.
             let platform = PixiPlatform::from_subdir(host_subdir());
-            return Self::for_platforms(&environment, std::iter::once(&platform), channel_config);
+            return Self::for_platforms(
+                &environment,
+                std::iter::once(&platform),
+                channel_config,
+                true,
+            );
         }
         let subdirs = candidate_subdirs(host_subdir());
         let platform_names = environment.platforms();
         let platforms = manifest.workspace.platforms.iter().filter(|platform| {
             platform_names.contains(platform.name()) && subdirs.contains(&platform.subdir())
         });
-        Self::for_platforms(&environment, platforms, channel_config)
+        Self::for_platforms(&environment, platforms, channel_config, true)
     }
 
     fn for_platforms<'a, 'source>(
         environment: &impl FeaturesExt<'source>,
         platforms: impl IntoIterator<Item = &'a PixiPlatform>,
         channel_config: &rattler_conda_types::ChannelConfig,
+        include_specs: bool,
     ) -> Result<Self, HostProbeError> {
         let channels = environment
             .channel_urls(channel_config)
@@ -1100,6 +1142,9 @@ impl HostScope {
                     .into_iter()
                     .map(|package| package.name),
             );
+            if !include_specs {
+                continue;
+            }
             for (name, spec) in environment
                 .combined_dependencies(Some(platform))
                 .iter_specs()
@@ -1118,7 +1163,7 @@ impl HostScope {
         }
         Ok(Self {
             channels,
-            specs,
+            specs: include_specs.then_some(specs),
             names,
         })
     }
@@ -1127,14 +1172,27 @@ impl HostScope {
         &self,
         detector: &HostDetector,
     ) -> Result<HostDetection, HostProbeError> {
-        Ok(detector
-            .detect_for_specs_with_wanted(
-                &self.channels,
-                host_subdir(),
-                &self.specs,
-                WantedNames::Only(self.names.clone()),
-            )
-            .await?)
+        Ok(match &self.specs {
+            Some(specs) => {
+                detector
+                    .detect_for_specs_with_wanted(
+                        &self.channels,
+                        host_subdir(),
+                        specs,
+                        WantedNames::Only(self.names.clone()),
+                    )
+                    .await?
+            }
+            None => {
+                detector
+                    .detect_for_target(
+                        &self.channels,
+                        host_subdir(),
+                        WantedNames::Only(self.names.clone()),
+                    )
+                    .await?
+            }
+        })
     }
 }
 
@@ -1401,14 +1459,14 @@ default = {{ features = ["plain"], no-default-feature = true }}
         )
         .unwrap();
         let scope = HostScope::for_environment(&workspace.default_environment().into()).unwrap();
-        assert!(scope.specs.is_empty());
+        assert!(scope.specs.as_ref().unwrap().is_empty());
         assert!(scope.names.is_empty());
         let script_scope = HostScope::for_script(
             (&workspace).workspace_manifest(),
             &workspace.channel_config(),
         )
         .unwrap();
-        assert!(script_scope.specs.is_empty());
+        assert!(script_scope.specs.as_ref().unwrap().is_empty());
         assert!(script_scope.names.is_empty());
     }
 
@@ -1460,7 +1518,8 @@ default = {{ features = ["plain"], no-default-feature = true }}
             .unwrap();
             let (manifest, _) = script.into_workspace_manifest(None, root).unwrap();
             let scope = HostScope::for_script(&manifest, &channel_config).unwrap();
-            assert_eq!(scope.specs.len(), 4);
+            let specs = scope.specs.as_ref().unwrap();
+            assert_eq!(specs.len(), 4);
             for (name, version) in [
                 ("shared-consumer", ">=1"),
                 ("shared-consumer", "<4"),
@@ -1475,7 +1534,7 @@ default = {{ features = ["plain"], no-default-feature = true }}
                     PackageName::new_unchecked(name).into(),
                 );
                 assert!(
-                    scope.specs.contains(&expected),
+                    specs.contains(&expected),
                     "missing {expected} for explicit_platform={explicit_platform}",
                 );
             }

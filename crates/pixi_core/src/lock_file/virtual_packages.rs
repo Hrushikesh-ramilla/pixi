@@ -9,9 +9,11 @@ use pixi_manifest::{
 use pypi_modifiers::pypi_tags::{PyPITagError, get_tags_from_machine, is_python_record};
 use rattler_conda_types::ParseMatchSpecError;
 use rattler_conda_types::ParseStrictness::Lenient;
-use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Subdir, Version, VersionSpec};
+use rattler_conda_types::{
+    GenericVirtualPackage, MatchSpec, PackageName, Subdir, Version, VersionSpec,
+};
 use rattler_lock::{CondaPackageData, ConversionError, LockFile, PypiPackageData};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use thiserror::Error;
 use uv_distribution_filename::WheelFilename;
@@ -178,6 +180,63 @@ pub(crate) fn compute_required_virtual_package_specs(
             (subdir, required_virtual_package_specs(&depends))
         })
         .collect()
+}
+
+/// The virtual packages the locked packages and platforms need from the host.
+pub(crate) struct LockedHostRequirements {
+    pub names: BTreeSet<PackageName>,
+    pub has_source_packages: bool,
+}
+
+pub(crate) fn locked_host_requirements(
+    lock_file: &LockFile,
+    environment_name: &EnvironmentName,
+    platforms: &[&PixiPlatform],
+) -> Result<LockedHostRequirements, MachineValidationError> {
+    let environment = lock_file
+        .environment(environment_name.as_str())
+        .ok_or_else(|| {
+            MachineValidationError::EnvironmentNotFound(environment_name.as_str().to_owned())
+        })?;
+    let mut names = BTreeSet::new();
+    let mut has_source_packages = false;
+    for platform in platforms {
+        names.extend(
+            platform
+                .customised_virtual_packages()
+                .into_iter()
+                .map(|package| package.name),
+        );
+        let Some(locked_platform) = super::resolve_lock_platform_for(lock_file, platform) else {
+            continue;
+        };
+        if let Some(packages) = environment.conda_packages(locked_platform) {
+            for package in packages {
+                has_source_packages |= package.as_source().is_some();
+                let depends: Vec<_> = package.depends().iter().map(String::as_str).collect();
+                names.extend(
+                    get_required_virtual_packages_from_depends(&depends)?
+                        .into_iter()
+                        .filter_map(|spec| spec.name.as_exact().cloned()),
+                );
+            }
+        }
+        if environment.has_pypi_packages(locked_platform) {
+            // Wheel tags depend on these, even without a conda dependency on them.
+            let wheel_names: &[&str] = if platform.subdir().is_linux() {
+                &["__glibc", "__musl", "__eglibc"]
+            } else if platform.subdir().is_osx() {
+                &["__osx"]
+            } else {
+                &[]
+            };
+            names.extend(wheel_names.iter().copied().map(PackageName::new_unchecked));
+        }
+    }
+    Ok(LockedHostRequirements {
+        names,
+        has_source_packages,
+    })
 }
 
 /// The virtual-package requirements some dependency in `depends` places on the
@@ -412,6 +471,54 @@ mod test {
                 .iter()
                 .contains(&MatchSpec::from_str("__cuda >=12", Lenient).unwrap())
         );
+    }
+
+    #[test]
+    fn locked_host_demand_includes_transitive_requirements_and_declarations() {
+        let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock_file = LockFile::from_path(
+            &root_dir.join("../../tests/data/lock_files/cuda_virtual_dependency.lock"),
+        )
+        .unwrap();
+        let platform = PixiPlatform::new(
+            PixiPlatformName::try_from("declared").unwrap(),
+            Subdir::Linux64,
+            vec![GenericVirtualPackage {
+                name: PackageName::from_str("__declared_only").unwrap(),
+                version: Version::from_str("1").unwrap(),
+                build_string: String::new(),
+            }],
+        )
+        .unwrap();
+        let demand =
+            locked_host_requirements(&lock_file, &EnvironmentName::default(), &[&platform])
+                .unwrap();
+        assert!(
+            demand
+                .names
+                .contains(&PackageName::from_str("__cuda").unwrap())
+        );
+        assert!(
+            demand
+                .names
+                .contains(&PackageName::from_str("__declared_only").unwrap())
+        );
+        assert!(!demand.has_source_packages);
+    }
+
+    #[test]
+    fn locked_host_demand_preserves_wheel_tag_inputs() {
+        let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock_file =
+            LockFile::from_path(&root_dir.join("../../tests/data/lock_files/pypi-numpy.lock"))
+                .unwrap();
+        let platform = PixiPlatform::from_subdir(Subdir::Linux64);
+        let demand =
+            locked_host_requirements(&lock_file, &EnvironmentName::default(), &[&platform])
+                .unwrap();
+        for name in ["__glibc", "__musl", "__eglibc"] {
+            assert!(demand.names.contains(&PackageName::from_str(name).unwrap()));
+        }
     }
 
     #[test]

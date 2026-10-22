@@ -81,7 +81,7 @@ use crate::{
         reporter::SolveProgressBar,
         virtual_packages::{
             MachineValidationError, UnknownNames, compute_required_virtual_package_specs,
-            validate_system_meets_environment_requirements,
+            locked_host_requirements, validate_system_meets_environment_requirements,
         },
     },
     workspace::{
@@ -465,9 +465,6 @@ impl Workspace {
         if !options.lock_file_usage.allow_updates() {
             miette::bail!("lock file not up-to-date with the workspace");
         }
-
-        // Solving orders and selects platforms by what this machine provides.
-        self.refresh_environment_hosts().await?;
 
         // The environments whose conda dependencies are about to be re-solved.
         // Captured before `outdated` is moved so we can validate their requested
@@ -1074,6 +1071,71 @@ impl<'p> LockFileDerivedData<'p> {
         Some((PlatformData::from(resolved), minimum))
     }
 
+    /// Detects what installing `environment` needs from the host. A reusable
+    /// prefix needs no detection.
+    pub async fn prepare_environment_host(
+        &self,
+        environment: &Environment<'p>,
+        update_mode: UpdateMode,
+    ) -> Result<(), UpdatePrefixError> {
+        if update_mode == UpdateMode::QuickValidate && self.reusable_prefix(environment).is_some() {
+            return Ok(());
+        }
+        self.prepare_locked_environment_host(environment).await
+    }
+
+    async fn prepare_locked_environment_host(
+        &self,
+        environment: &Environment<'p>,
+    ) -> Result<(), UpdatePrefixError> {
+        // Let the install path report the missing environment.
+        if self
+            .lock_file
+            .environment(environment.name().as_str())
+            .is_none()
+        {
+            return Ok(());
+        }
+        let target = self.target_platform.as_ref().map(InstallTarget::name);
+        let subdirs = pixi_manifest::platform::candidate_subdirs(
+            pixi_manifest::platform::host::host_subdir(),
+        );
+        let declared = environment.platforms();
+        let platforms: Vec<_> = self
+            .workspace
+            .workspace
+            .value
+            .workspace
+            .platforms
+            .iter()
+            .filter(|platform| {
+                declared.contains(platform.name())
+                    && target.map_or_else(
+                        || subdirs.contains(&platform.subdir()),
+                        |target| target == platform.name(),
+                    )
+            })
+            .collect();
+        let requirements =
+            locked_host_requirements(&self.lock_file, environment.name(), &platforms).map_err(
+                |source| UpdatePrefixError::RequirementsUnmet {
+                    environment: environment.name().clone(),
+                    source,
+                },
+            )?;
+        if requirements.has_source_packages {
+            // Source builds may solve, which needs the repodata query.
+            self.workspace
+                .refresh_environment_hosts_for_environments(std::slice::from_ref(environment))
+                .await?;
+        } else {
+            self.workspace
+                .refresh_environment_hosts_for_locked_install(environment, requirements.names)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Returns the up-to-date prefix for the given environment.
     pub async fn prefix(
         &self,
@@ -1085,34 +1147,27 @@ impl<'p> LockFileDerivedData<'p> {
         // An installed prefix that matches the lock file runs without detecting
         // the host. Detector-provided names are unknown then and not checked.
         if update_mode == UpdateMode::QuickValidate
-            && let Some(platform) = self.reusable_prefix_platform(environment)
-            && let Some(locked_environment) =
-                self.lock_file.environment(environment.name().as_str())
+            && let Some((platform, prefix)) = self.reusable_prefix(environment)
         {
-            let hash = LockedEnvironmentHash::from_environment(locked_environment, Some(platform));
-            if let Some(prefix) = self.cached_prefix(environment, platform, &hash) {
-                if !matches!(self.target_platform, Some(InstallTarget::Explicit(_)))
-                    && !platform_override_is_foreign()
-                {
-                    validate_system_meets_environment_requirements(
-                        &self.lock_file,
-                        platform,
-                        environment.name(),
-                        &environment.host_for_cached_run(),
-                        UnknownNames::Unchecked,
-                    )
-                    .map_err(|source| {
-                        UpdatePrefixError::RequirementsUnmet {
-                            environment: environment.name().clone(),
-                            source,
-                        }
-                    })?;
-                }
-                return Ok(prefix);
+            if !matches!(self.target_platform, Some(InstallTarget::Explicit(_)))
+                && !platform_override_is_foreign()
+            {
+                validate_system_meets_environment_requirements(
+                    &self.lock_file,
+                    platform,
+                    environment.name(),
+                    &environment.host_for_cached_run(),
+                    UnknownNames::Unchecked,
+                )
+                .map_err(|source| UpdatePrefixError::RequirementsUnmet {
+                    environment: environment.name().clone(),
+                    source,
+                })?;
             }
+            return Ok(prefix);
         }
 
-        self.workspace.refresh_environment_hosts().await?;
+        self.prepare_locked_environment_host(environment).await?;
 
         // A current prefix hash says nothing about this machine's capabilities.
         // Validate locked requirements before either the cached or install path.
@@ -1237,6 +1292,14 @@ impl<'p> LockFileDerivedData<'p> {
                     declared.is_empty() || declared.contains(platform.name())
                 }),
         }
+    }
+
+    /// The installed prefix that matches the lock file, with its platform.
+    fn reusable_prefix(&self, environment: &Environment<'p>) -> Option<(&'p PixiPlatform, Prefix)> {
+        let platform = self.reusable_prefix_platform(environment)?;
+        let locked_environment = self.lock_file.environment(environment.name().as_str())?;
+        let hash = LockedEnvironmentHash::from_environment(locked_environment, Some(platform));
+        Some((platform, self.cached_prefix(environment, platform, &hash)?))
     }
 
     /// The installed prefix of `environment` if its environment file matches
@@ -2223,6 +2286,22 @@ impl<'p> UpdateContextBuilder<'p> {
             }
         };
         let lock_file = input.lock_file;
+
+        // Only the environments being solved need their hosts.
+        let solving_environments = outdated
+            .conda
+            .keys()
+            .chain(outdated.pypi.keys())
+            .flat_map(|environment| {
+                GroupedEnvironment::from(environment.clone())
+                    .environments()
+                    .collect_vec()
+            })
+            .unique()
+            .collect_vec();
+        project
+            .refresh_environment_hosts_for_environments(&solving_environments)
+            .await?;
 
         // Key locked conda records by the env's declared (possibly rich) platform
         // names so pre-rich, base-subdir-keyed lock files still feed rich lookups.

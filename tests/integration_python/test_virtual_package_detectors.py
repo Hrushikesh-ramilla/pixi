@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import functools
 import hashlib
+import http.server
 import io
 import json
 import os
 import shlex
 import shutil
 import tarfile
+import threading
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,11 +41,18 @@ class DetectorChannel:
     def url(self) -> str:
         return self.root.resolve().as_uri() + "/"
 
-    def package(self, name: str, depends: list[str], files: dict[str, bytes] | None = None) -> None:
+    def package(
+        self,
+        name: str,
+        depends: list[str],
+        files: dict[str, bytes] | None = None,
+        *,
+        version: str = "1.0",
+    ) -> None:
         files = files or {}
         index = {
             "name": name,
-            "version": "1.0",
+            "version": version,
             "build": "0",
             "build_number": 0,
             "subdir": "noarch",
@@ -68,7 +79,7 @@ class DetectorChannel:
         }
         noarch = self.root / "noarch"
         noarch.mkdir(parents=True, exist_ok=True)
-        filename = f"{name}-1.0-0.tar.bz2"
+        filename = f"{name}-{version}-0.tar.bz2"
         archive = noarch / filename
         with tarfile.open(archive, "w:bz2") as package:
             for path, content in members.items():
@@ -505,8 +516,9 @@ def test_locked_run_keeps_the_installed_alias_until_it_is_reinstalled(
     assert (workspace / "pixi.lock").read_bytes() == lock
 
 
+@pytest.mark.parametrize("script_workspace", [False, True], ids=["workspace", "script"])
 def test_channel_add_uses_new_effective_detector_scope_before_installing(
-    detector_sandbox: DetectorSandbox,
+    detector_sandbox: DetectorSandbox, script_workspace: bool
 ) -> None:
     sandbox = detector_sandbox
     packages = DetectorChannel(sandbox.root / "packages")
@@ -517,14 +529,36 @@ def test_channel_add_uses_new_effective_detector_scope_before_installing(
         "channel-mutation", [packages], CAPABILITY, consumer="scope-consumer"
     )
     sandbox.decision(workspace, detectors, "allow")
-    sandbox.run(workspace, "lock")
+    script_args: list[str] = []
+    if script_workspace:
+        script = workspace / "channel-mutation.code"
+        metadata = (
+            f'channels = ["{packages.url}"]\n'
+            f'entrypoint = "{bat_extension("scope-consumer")}"\n'
+            "\n[tool.pixi.workspace]\n"
+            f'platforms = [{{ name = "capable", platform = "{CURRENT_PLATFORM}", {CAPABILITY} = "3.0" }}]\n'
+            '\n[tool.pixi.dependencies]\nscope-consumer = "*"\n'
+        )
+        script.write_text(
+            "# /// conda-script\n"
+            + "".join(f"# {line}\n" for line in metadata.splitlines())
+            + "# /// end-conda-script\n",
+            encoding="utf-8",
+        )
+        script_args = ["--script", str(script)]
+    sandbox.run(workspace, "lock", *script_args)
     assert not marker.exists()
 
-    sandbox.run(workspace, "workspace", "channel", "add", "--prepend", detectors.url)
+    sandbox.run(workspace, "workspace", "channel", "add", *script_args, "--prepend", detectors.url)
     assert marker.exists(), (
         "channel mutation must prepare the new host before the same command installs"
     )
-    assert "consumer-ready" in sandbox.run(workspace, "run", bat_extension("scope-consumer")).stdout
+    run_args = (
+        ["--experimental", *script_args, "--locked"]
+        if script_workspace
+        else [bat_extension("scope-consumer")]
+    )
+    assert "consumer-ready" in sandbox.run(workspace, "run", *run_args).stdout
 
 
 @pytest.mark.parametrize(
@@ -638,6 +672,342 @@ def test_installed_environment_ignores_uninstalled_sibling_detectors(
     ):
         sandbox.run(workspace, *command)
         assert marker.read_text(encoding="utf-8").splitlines() == installed_runs, command
+
+
+@pytest.fixture
+def installed_default_with_http_sibling(
+    detector_sandbox: DetectorSandbox,
+) -> Iterator[tuple[Path, list[str], Path]]:
+    sandbox = detector_sandbox
+    base = DetectorChannel(sandbox.root / "base-channel")
+    base.package("base-package", [])
+    sibling = DetectorChannel(sandbox.root / "sibling-channel")
+    marker = sibling.detector("sibling-detect", CAPABILITY)
+    sibling.consumer("sibling-consumer", CAPABILITY, ">=3")
+    requests: list[str] = []
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            super().do_GET()
+
+        def do_HEAD(self) -> None:
+            requests.append(self.path)
+            super().do_HEAD()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Handler, directory=str(sibling.root))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        sibling_url = f"http://127.0.0.1:{server.server_address[1]}/"
+        workspace = sandbox.workspace("http-siblings", [base])
+        (workspace / "pixi.toml").write_text(
+            '[workspace]\nname = "http-siblings"\n'
+            f"channels = {json.dumps([base.url])}\n"
+            "platforms = [\n"
+            f'  "{CURRENT_PLATFORM}",\n'
+            f'  {{ name = "capable", platform = "{CURRENT_PLATFORM}", {CAPABILITY} = "3.0" }},\n'
+            "]\n"
+            '\n[dependencies]\nbase-package = "*"\n'
+            '\n[tasks]\ncheck = "echo default-ready"\n'
+            'workflow = { cmd = "echo workflow-ready", '
+            'depends-on = [{ task = "child", environment = "sibling" }] }\n'
+            "\n[feature.sibling]\n"
+            f"channels = {json.dumps([sibling_url])}\n"
+            'platforms = ["capable"]\n'
+            '\n[feature.sibling.dependencies]\nsibling-consumer = "*"\n'
+            "\n[feature.sibling.target.capable.tasks]\n"
+            'child = "echo detected-child-ready"\n'
+            "\n[environments]\n"
+            f'default = {{ features = [], platforms = ["{CURRENT_PLATFORM}"] }}\n'
+            'sibling = ["sibling"]\n',
+            encoding="utf-8",
+        )
+        sandbox.run(
+            workspace,
+            "config",
+            "set",
+            "--shared",
+            f'virtual-package-detectors.consent."{sibling_url}"',
+            "allow",
+        )
+        sandbox.run(workspace, "lock")
+        assert requests, "the counting server must observe channel discovery during locking"
+        sandbox.run(workspace, "install", "--locked", "-e", "default")
+        assert (default_env_path(workspace) / "conda-meta" / "base-package-1.0-0.json").exists()
+        assert not (workspace / ".pixi" / "envs" / "sibling").exists()
+        marker.unlink(missing_ok=True)
+        requests.clear()
+        # A fresh cache makes every repodata request visible.
+        sandbox.env["PIXI_CACHE_DIR"] = str(sandbox.root / "run-cache")
+        yield workspace, requests, marker
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_frozen_implicit_executable_does_not_discover_uninstalled_sibling_channel(
+    detector_sandbox: DetectorSandbox,
+    installed_default_with_http_sibling: tuple[Path, list[str], Path],
+) -> None:
+    workspace, requests, marker = installed_default_with_http_sibling
+    lock = (workspace / "pixi.lock").read_bytes()
+    output = detector_sandbox.run(workspace, "run", "--frozen", "echo", "executable-ready")
+    assert "executable-ready" in output.stdout
+    assert requests == []
+    assert not marker.exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+    assert (default_env_path(workspace) / "conda-meta" / "base-package-1.0-0.json").exists()
+    assert not (workspace / ".pixi" / "envs" / "sibling").exists()
+
+
+def test_frozen_inherited_task_does_not_discover_uninstalled_sibling_channel(
+    detector_sandbox: DetectorSandbox,
+    installed_default_with_http_sibling: tuple[Path, list[str], Path],
+) -> None:
+    workspace, requests, marker = installed_default_with_http_sibling
+    lock = (workspace / "pixi.lock").read_bytes()
+    output = detector_sandbox.run(workspace, "run", "--frozen", "check")
+    assert "default-ready" in output.stdout
+    assert requests == []
+    assert not marker.exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+    assert (default_env_path(workspace) / "conda-meta" / "base-package-1.0-0.json").exists()
+    assert not (workspace / ".pixi" / "envs" / "sibling").exists()
+
+
+def test_frozen_implicit_task_selects_detector_dependent_sibling(
+    detector_sandbox: DetectorSandbox,
+    installed_default_with_http_sibling: tuple[Path, list[str], Path],
+) -> None:
+    workspace, requests, marker = installed_default_with_http_sibling
+    lock = (workspace / "pixi.lock").read_bytes()
+    output = detector_sandbox.run(workspace, "run", "--frozen", "child")
+    assert "detected-child-ready" in output.stdout
+    assert requests
+    assert marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert (
+        workspace / ".pixi" / "envs" / "sibling" / "conda-meta" / "sibling-consumer-1.0-0.json"
+    ).exists()
+    assert (default_env_path(workspace) / "conda-meta" / "base-package-1.0-0.json").exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+
+
+def test_frozen_cross_environment_task_detects_only_when_dependency_is_reached(
+    detector_sandbox: DetectorSandbox,
+    installed_default_with_http_sibling: tuple[Path, list[str], Path],
+) -> None:
+    sandbox = detector_sandbox
+    workspace, requests, marker = installed_default_with_http_sibling
+    lock = (workspace / "pixi.lock").read_bytes()
+    output = sandbox.run(workspace, "run", "--frozen", "--skip-deps", "workflow")
+    assert "workflow-ready" in output.stdout
+    assert "detected-child-ready" not in output.stdout
+    assert requests == []
+    assert not marker.exists()
+    assert not (workspace / ".pixi" / "envs" / "sibling").exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+
+    output = sandbox.run(workspace, "run", "--frozen", "workflow")
+    assert "detected-child-ready" in output.stdout
+    assert "workflow-ready" in output.stdout
+    assert requests
+    assert marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert (
+        workspace / ".pixi" / "envs" / "sibling" / "conda-meta" / "sibling-consumer-1.0-0.json"
+    ).exists()
+    assert (default_env_path(workspace) / "conda-meta" / "base-package-1.0-0.json").exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+
+
+@pytest.mark.parametrize(
+    "platform_requirement",
+    ["", ', __unused_platform_capability = "1"'],
+    ids=["no-manifest-capability", "unsatisfied-unlocked-platform-capability"],
+)
+def test_frozen_fresh_install_detects_transitive_locked_requirements_not_available_candidates(
+    detector_sandbox: DetectorSandbox,
+    platform_requirement: str,
+) -> None:
+    sandbox = detector_sandbox
+    channel = DetectorChannel(sandbox.root / "channel")
+    required_marker = channel.detector("required-detect", CAPABILITY)
+    unused_capability = "__unused_candidate_capability"
+    unused_marker = channel.detector("unused-detect", unused_capability)
+    channel.package("bridge", [f"{CAPABILITY} >=3"])
+    channel.package(
+        "root-client",
+        ["bridge >=1"],
+        {
+            "bin/root-client": b"#!/bin/sh\necho transitive-ready\n",
+            "Scripts/root-client.bat": b"@echo off\r\necho transitive-ready\r\n",
+        },
+    )
+    workspace = sandbox.workspace(
+        "transitive-locked-demand", [channel], CAPABILITY, consumer="root-client"
+    )
+    sandbox.decision(workspace, channel, "allow")
+    sandbox.run(workspace, "lock")
+    lock = (workspace / "pixi.lock").read_bytes()
+    assert not default_env_path(workspace).exists()
+
+    # `--frozen` ignores this manifest change: only the locked `bridge` needs
+    # the capability now.
+    manifest = workspace / "pixi.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            f', {CAPABILITY} = "3.0"', platform_requirement
+        ),
+        encoding="utf-8",
+    )
+    channel.package("bridge", [f"{unused_capability} >=1"], version="2.0")
+    required_marker.unlink(missing_ok=True)
+    unused_marker.unlink(missing_ok=True)
+    sandbox.env["PIXI_CACHE_DIR"] = str(sandbox.root / "frozen-cache")
+
+    output = sandbox.run(workspace, "run", "--frozen", bat_extension("root-client"))
+    assert "transitive-ready" in output.stdout
+    assert required_marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert not unused_marker.exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+    prefix = default_env_path(workspace)
+    assert (prefix / "conda-meta" / "root-client-1.0-0.json").exists()
+    assert (prefix / "conda-meta" / "bridge-1.0-0.json").exists()
+    assert not (prefix / "conda-meta" / "bridge-2.0-0.json").exists()
+
+    shutil.rmtree(prefix)
+    output = sandbox.run(
+        workspace,
+        "run",
+        "--frozen",
+        bat_extension("root-client"),
+        overrides={f"CONDA_OVERRIDE_{KEY.upper()}": "2.0"},
+        expected=ExitCode.FAILURE,
+    )
+    assert CAPABILITY in output.stderr
+    assert "transitive-ready" not in output.stdout
+    assert not (prefix / "conda-meta" / "root-client-1.0-0.json").exists()
+    assert not (prefix / "conda-meta" / "bridge-1.0-0.json").exists()
+    assert not unused_marker.exists()
+    assert required_marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert (workspace / "pixi.lock").read_bytes() == lock
+
+
+def test_frozen_install_expands_platform_detection_with_locked_requirements(
+    detector_sandbox: DetectorSandbox,
+) -> None:
+    sandbox = detector_sandbox
+    channel = DetectorChannel(sandbox.root / "channel")
+    platform_marker = channel.detector("platform-detect", CAPABILITY)
+    locked_capability = "__locked_capability"
+    locked_marker = channel.detector("locked-detect", locked_capability)
+    channel.package("bridge", [f"{locked_capability} >=3"])
+    channel.consumer("consumer", "bridge", ">=1")
+    workspace = sandbox.workspace("expanded-demand", [channel], CAPABILITY, consumer="consumer")
+    manifest = workspace / "pixi.toml"
+    declared = f', {CAPABILITY} = "3.0"'
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        .replace(declared, f'{declared}, {locked_capability} = "3.0"')
+        .replace("echo selected-capable-platform", bat_extension("consumer")),
+        encoding="utf-8",
+    )
+    sandbox.decision(workspace, channel, "allow")
+    sandbox.run(workspace, "lock")
+    lock = (workspace / "pixi.lock").read_bytes()
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(f', {locked_capability} = "3.0"', ""),
+        encoding="utf-8",
+    )
+    platform_marker.unlink()
+    locked_marker.unlink()
+    sandbox.env["PIXI_CACHE_DIR"] = str(sandbox.root / "run-cache")
+
+    output = sandbox.run(workspace, "run", "--frozen", "check")
+    assert "consumer-ready" in output.stdout
+    assert platform_marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert locked_marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    assert (default_env_path(workspace) / "conda-meta" / "bridge-1.0-0.json").exists()
+    assert (workspace / "pixi.lock").read_bytes() == lock
+
+
+def test_add_prepares_hosts_for_every_outdated_environment(
+    detector_sandbox: DetectorSandbox,
+) -> None:
+    sandbox = detector_sandbox
+    channel = DetectorChannel(sandbox.root / "channel")
+    channel.package("base-package", [])
+    channel.package("added-package", [])
+    channel.package("late-package", [])
+    marker = channel.detector("sibling-detect", CAPABILITY)
+    channel.consumer("sibling-consumer", CAPABILITY, ">=3")
+    workspace = sandbox.workspace("add-outdated-sibling", [channel])
+    manifest = workspace / "pixi.toml"
+    manifest.write_text(
+        '[workspace]\nname = "add-outdated-sibling"\n'
+        f"channels = {json.dumps([channel.url])}\n"
+        "platforms = [\n"
+        f'  "{CURRENT_PLATFORM}",\n'
+        f'  {{ name = "capable", platform = "{CURRENT_PLATFORM}", {CAPABILITY} = "3.0" }},\n'
+        "]\n"
+        '\n[dependencies]\nbase-package = "*"\n'
+        "\n[feature.extra]\n"
+        f'platforms = ["{CURRENT_PLATFORM}"]\n'
+        "\n[feature.sibling]\n"
+        'platforms = ["capable"]\n'
+        '\n[feature.sibling.dependencies]\nsibling-consumer = "*"\n'
+        "\n[environments]\n"
+        'default = ["extra"]\n'
+        'sibling = ["sibling"]\n',
+        encoding="utf-8",
+    )
+    sandbox.decision(workspace, channel, "allow")
+    sandbox.run(workspace, "lock")
+
+    # `add` to a feature `sibling` doesn't use still re-solves the outdated `sibling`.
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            'sibling-consumer = "*"\n', 'sibling-consumer = "*"\nlate-package = "*"\n'
+        ),
+        encoding="utf-8",
+    )
+    marker.unlink(missing_ok=True)
+    # A fresh cache, so the detector has to run again.
+    sandbox.env["PIXI_CACHE_DIR"] = str(sandbox.root / "add-cache")
+    sandbox.run(workspace, "add", "--feature", "extra", "--no-install", "added-package")
+
+    assert marker.read_text(encoding="utf-8").splitlines() == ["run"]
+    lock = (workspace / "pixi.lock").read_text(encoding="utf-8")
+    assert "added-package" in lock
+    assert "late-package" in lock
+
+
+def test_frozen_run_reports_environment_missing_from_lock_file(
+    detector_sandbox: DetectorSandbox,
+) -> None:
+    sandbox = detector_sandbox
+    channel = DetectorChannel(sandbox.root / "channel")
+    channel.package("base-package", [])
+    workspace = sandbox.workspace("missing-locked-env", [channel], consumer="base-package")
+    sandbox.run(workspace, "lock")
+    manifest = workspace / "pixi.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        + '\n[feature.extra.dependencies]\nbase-package = "*"\n'
+        + '\n[environments]\nextra = ["extra"]\n',
+        encoding="utf-8",
+    )
+
+    output = sandbox.run(
+        workspace, "run", "--frozen", "-e", "extra", "check", expected=ExitCode.FAILURE
+    )
+    assert "lock file is not up-to-date with the requested environment 'extra'" in output.stderr
 
 
 def info_workspace(sandbox: DetectorSandbox, channel: DetectorChannel, scope: str) -> Path:

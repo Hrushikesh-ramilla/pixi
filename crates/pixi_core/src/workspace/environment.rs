@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     hash::{Hash, Hasher},
-    sync::{Arc, Once},
+    sync::Once,
 };
 
 use indexmap::IndexMap;
@@ -88,10 +88,7 @@ impl<'p> Environment<'p> {
     /// Host capabilities detected with this environment's effective solve channels.
     pub fn host(&self) -> &'p HostDetection {
         self.workspace
-            .environment_hosts
-            .get()
-            .and_then(|hosts| hosts.get(self.name()))
-            .map(Arc::as_ref)
+            .prepared_environment_host(self.name())
             .unwrap_or(&self.workspace.host)
     }
 

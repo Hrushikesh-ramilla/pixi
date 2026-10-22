@@ -378,42 +378,26 @@ pub async fn execute(mut args: Args) -> miette::Result<ExitCode> {
     // Sanity check of prefix location
     sanity_check_workspace(&workspace).await?;
 
-    if let Some(environment) = &explicit_environment {
-        workspace
-            .refresh_environment_hosts_for_platform_selection(std::slice::from_ref(environment))
-            .await?;
-    } else {
-        workspace
-            .refresh_environment_hosts_for_platform_selection(&workspace.environments())
-            .await?;
-    }
-
     // `--platform` pins which declared platform the environment is installed
     // and activated for. Without it we auto-upgrade to the platform the
     // environment was last installed for (so users need not repeat
     // `--platform`), falling back to the host-aware best match when the
     // environment isn't installed yet.
     let user_platform = resolve_install_platform(&workspace, args.platform.as_ref())?;
-    let run_platform = user_platform
-        .clone()
-        .or_else(|| environment.installed_resolved_platform_name());
-    let best_declared_platform = environment.named_or_best_declared_platform(run_platform.as_ref());
 
     // A `--platform` the environment doesn't list is a membership error. With
     // no platform requested, defer to the install path's minimum fallback.
     if args.lock_and_install_config.allow_installs()
-        && best_declared_platform.is_none()
         && let Some(name) = user_platform.as_ref()
+        && environment
+            .named_or_best_declared_platform(Some(name))
+            .is_none()
     {
         return Err(miette::miette!(
             "platform '{}' is not part of environment '{}'",
             name,
             environment.name(),
         ));
-    }
-
-    if args.lock_and_install_config.allow_installs() {
-        environment.emit_emulation_warning();
     }
 
     // Top-level progress, kept here so we can clear it between phases.
@@ -473,7 +457,8 @@ pub async fn execute(mut args: Args) -> miette::Result<ExitCode> {
             PreferExecutable::TaskFirst
         },
         args.templated,
-    )?;
+    )
+    .await?;
     tracing::debug!("Task graph: {}", task_graph);
 
     // Print dry-run message if dry-run mode is enabled
@@ -497,24 +482,48 @@ pub async fn execute(mut args: Args) -> miette::Result<ExitCode> {
 
     let init_cwd = std::env::current_dir().ok();
     for task_id in task_graph.topological_order() {
-        let executable_task =
-            ExecutableTask::from_task_graph(&task_graph, task_id, init_cwd.clone());
-
-        // If the task is not executable (e.g. an alias), we skip it. This ensures we
-        // don't instantiate a prefix for an alias.
-        if !executable_task.task().is_executable() {
+        let node = &task_graph[task_id];
+        if !node.task.is_executable() {
             continue;
+        }
+        if args.lock_and_install_config.allow_installs() {
+            // Pin the platform this environment was last installed for.
+            if user_platform.is_none() {
+                lock_file.set_installed_target_platform(
+                    node.run_environment.installed_resolved_platform_name(),
+                );
+            }
+            workspace
+                .refresh_environment_hosts_for_platform_selection(std::slice::from_ref(
+                    &node.run_environment,
+                ))
+                .await?;
+            node.run_environment.emit_emulation_warning();
         }
 
         // Classify how this machine runs the task's environment. A `--platform`
         // override means the user vouches for the machine, so skip the check.
         let runnability =
-            (args.lock_and_install_config.allow_installs() && user_platform.is_none()).then(|| {
-                classify_environment_runnability(
-                    &executable_task.run_environment,
-                    Some(lock_file.as_lock_file()),
-                )
-            });
+            if args.lock_and_install_config.allow_installs() && user_platform.is_none() {
+                let declared = classify_environment_runnability(&node.run_environment, None);
+                Some(if declared == EnvironmentRunnability::Unsupported {
+                    // The locked requirements may need detected capabilities.
+                    lock_file
+                        .prepare_environment_host(&node.run_environment, UpdateMode::QuickValidate)
+                        .await?;
+                    classify_environment_runnability(
+                        &node.run_environment,
+                        Some(lock_file.as_lock_file()),
+                    )
+                } else {
+                    declared
+                })
+            } else {
+                None
+            };
+
+        let executable_task =
+            ExecutableTask::from_task_graph(&task_graph, task_id, init_cwd.clone());
 
         // Fail before announcing a task whose environment can't run here at
         // all; by-accident environments proceed and `--platform` overrides.
@@ -631,16 +640,6 @@ pub async fn execute(mut args: Args) -> miette::Result<ExitCode> {
                 if args.lock_and_install_config.allow_installs()
                     && runnability != Some(EnvironmentRunnability::NoDependencies)
                 {
-                    // No `--platform`: pin to the platform this environment was
-                    // last installed for, not a sibling's bare subdir.
-                    if user_platform.is_none() {
-                        lock_file.set_installed_target_platform(
-                            executable_task
-                                .run_environment
-                                .installed_resolved_platform_name(),
-                        );
-                    }
-
                     // Ensure there is a valid prefix
                     lock_file
                         .prefix(

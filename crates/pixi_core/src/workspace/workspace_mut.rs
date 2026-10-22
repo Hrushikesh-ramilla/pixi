@@ -484,8 +484,6 @@ impl WorkspaceMut {
             return Ok((None, skipped_packages));
         }
 
-        self.workspace().refresh_environment_hosts().await?;
-
         let original_lock_file = self
             .workspace()
             .load_lock_file()
